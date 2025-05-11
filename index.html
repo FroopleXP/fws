@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <title>WS Demo</title>
+    </head>
+    <body>
+        <style type="text/css">
+            textarea {
+                height: 480px;
+                width: 640px;
+                resize: none;
+            }
+        </style>
+        <h1>WS Demo</h1>
+        <textarea id="status" disabled></textarea>
+        <script type="text/javascript">
+            const stat = document.getElementById("status")
+            if (stat == null) {
+                console.error("couldn't find status el, cannot continue");
+            }
+
+            const log = (msg) => stat.innerHTML = stat.value + msg + "\n";
+
+            window.onload = () => {
+                log("connecting to server");
+
+                const socket = new WebSocket("ws://localhost:3000");
+                socket.addEventListener("open", (e) => {
+                    socket.send("hi!")
+                });
+                socket.addEventListener("error", (e) => {
+                    log("error with socket, see log for more details");
+                    console.dir(e.error)
+                });
+            }
+        </script>
+    </body>
+</html>
