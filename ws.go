@@ -4,6 +4,7 @@ import (
 	"io"
 	"log"
 	"net"
+    "fmt"
 )
 
 const sockAddr string = ":3000"
@@ -50,7 +51,7 @@ const (
 func handle(c net.Conn) {
 	defer c.Close()
 
-	var buf []byte = make([]byte, 1024)
+	var buf []byte = make([]byte, 4096)
 
 	for {
 		_, err := c.Read(buf)
@@ -104,17 +105,21 @@ func handle(c net.Conn) {
             }
         }
 
-        var mask uint32 = 0
         if isMasked {
-            mask = (
-                uint32(buf[ptr])   << (32 - 8)  |
-                uint32(buf[ptr+1]) << (32 - 16) |
-                uint32(buf[ptr+2]) << (32 - 24) |
-                uint32(buf[ptr+3]) << (32 - 32))
+            var maskingKey [4]byte = [4]byte{ buf[ptr], buf[ptr+1], buf[ptr+2], buf[ptr+3] }
             ptr+=4
+
+            for i := range payloadLen {
+                buf[ptr+int(i)] ^= maskingKey[i % 4]
+            }
         }
 
-        log.Printf("client frame isFin=%t, fType=%s, isMasked=%t, payloadLen=%d, mask=%d\n", isFin, fType, isMasked, payloadLen, mask) 
+        for i := range payloadLen {
+            fmt.Printf("%c", buf[ptr+int(i)])
+        }
+        fmt.Printf("\n")
+
+        log.Printf("client frame isFin=%t, fType=%s, isMasked=%t, payloadLen=%d\n", isFin, fType, isMasked, payloadLen) 
 	}
 }
 
