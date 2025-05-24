@@ -26,7 +26,10 @@
 
                 const socket = new WebSocket("ws://localhost:3000");
                 socket.addEventListener("open", (e) => {
-                    socket.send("a".repeat(2_000))
+                    socket.send("If you can see this, it works!")
+                    socket.send("If you can see this, it works!")
+                    socket.send("a".repeat(200_000))
+                    //socket.send("b".repeat(2_000))
                 });
                 socket.addEventListener("error", (e) => {
                     log("error with socket, see log for more details");
