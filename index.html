@@ -20,20 +20,42 @@
             }
 
             const log = (msg) => stat.innerHTML = stat.value + msg + "\n";
+            const randTime = () => Math.floor(Math.random() * 30) * 1000
+            const send = (socket, msg) => {
+                log("client: " + msg);
+                return socket.send(msg);
+            }
 
             window.onload = () => {
                 log("connecting to server");
 
                 const socket = new WebSocket("ws://localhost:3000");
                 socket.addEventListener("open", (e) => {
-                    socket.send("If you can see this, it works!")
-                    socket.send("If you can see this, it works!")
-                    socket.send("a".repeat(200_000))
-                    //socket.send("b".repeat(2_000))
+                    //send(socket, "If you can see this, it works!")
+                    send(socket, "ab".repeat(1_000))
+
+                    const doMany = (time, f) => {
+                        f(time)
+                        setTimeout(() => {
+                            doMany(randTime(), f)
+                        }, time)
+                    }
+
+                    //doMany(randTime(), (t) => {
+                    //    send(socket, "This is a message, the next one in " + Math.floor(t / 1000) + " second(s)")
+                    //})
+
                 });
                 socket.addEventListener("error", (e) => {
                     log("error with socket, see log for more details");
-                    console.dir(e.error)
+                    console.dir(e)
+                });
+                socket.addEventListener("message", (e) => {
+                    log("server: " + e.data);
+                });
+                socket.addEventListener("close", (e) => {
+                    log("connection closed, (code " + e.code + ") see log for more details");
+                    console.dir(e);
                 });
             }
         </script>
