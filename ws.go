@@ -84,6 +84,12 @@ func send(w *bufio.Writer, h *header, b []byte) error {
 		totalPayloadBytesThisFrame := uint64(math.Min(float64(payloadBytesToWrite), float64(maxPayloadBytesPerFrame)))
 		h.length = totalPayloadBytesThisFrame
 
+        // If we're not on the first frame, we must set the 'continuation' op code
+        if payloadByteOffset > 0 {
+            h.op = continuation
+        }
+
+        // If we're on the last frame, set 'fin'
 		if payloadBytesToWrite < maxPayloadBytesPerFrame {
 			h.isFin = true
 		}
