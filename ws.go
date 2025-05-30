@@ -53,83 +53,43 @@ const (
 	mPayloadLen uint8 = 0x7f
 )
 
-func send(w net.Conn, t frameType, b []byte, payload []byte, payloadLen uint64) error {
-    headerLen := 2
+func send(w *bufio.Writer, h *header, b []byte) error {
+    // TODO: We're assuming here that we're always the server and thus we never mask
+    h.isFin = false
+    h.isMasked = false
 
-    if payloadLen > 125 {
-        if payloadLen <= math.MaxUint16 {
-            headerLen += 2
-        } else {
-            headerLen += 8
-        }
-    }
-
-    if cap(b) < headerLen {
-        panic("write buffer capacity is too short")
-    }
-
-    maxPayloadBytesPerFrame := uint64(cap(b) - headerLen)
     frame := 0
-    isFin := false
-    ptr := 0
+    payloadBytesToWrite := h.length
+    maxPayloadBytesPerFrame := uint64(w.Size()) - h.size()
+    payloadByteOffset := 0
 
-    log.Printf("starting to write frames payloadLen=%d, capacity=%d, maxPayloadBytesPerFrame=%d\n", payloadLen, cap(b), maxPayloadBytesPerFrame)
-
-    payloadBytesToWrite := payloadLen
+    log.Printf("starting to write frames payloadLen=%d, capacity=%d, maxPayloadBytesPerFrame=%d\n", h.length, w.Size(), maxPayloadBytesPerFrame)
 
     for payloadBytesToWrite > 0 {
-        ptr = 0
-
         totalPayloadBytesThisFrame := uint64(math.Min(float64(payloadBytesToWrite), float64(maxPayloadBytesPerFrame)))
-
-        // Are we on the last frame?
+        h.length = totalPayloadBytesThisFrame
+        
         if payloadBytesToWrite < maxPayloadBytesPerFrame {
-            isFin = true
+            h.isFin = true
         }   
 
-        if isFin {
-            b[ptr] = mFin
+        if err := h.write(w); err != nil {
+            return err
         }
 
-        // NOTE: Only on the first frame do we set the type
-        if frame == 0 {
-            b[ptr] |= byte(t)
-        }
-        ptr++
-
-        // NOTE: For each of these, we're assuming 'no-mask' which
-        // is normal for data being sent to the client from the server.
-        if totalPayloadBytesThisFrame <= 125 {
-            b[ptr] = byte(totalPayloadBytesThisFrame); ptr++
-        } else if totalPayloadBytesThisFrame <= math.MaxUint16 {
-            b[ptr] = byte(126); ptr++
-            for j := 16 - 8; j >= 0; j -= 8 {
-                b[ptr] = byte(totalPayloadBytesThisFrame >> j)
-                ptr++
-            }
-        } else if totalPayloadBytesThisFrame <= math.MaxUint64 {
-            b[ptr] = byte(127); ptr++
-            for j := 64 - 8; j >= 0; j -= 8 {
-                b[ptr] = byte(totalPayloadBytesThisFrame >> j)
-                ptr++
-            }
-        }
-
-        // NOTE: We're skipping the masking key as this func, currently, should
-        // only be used for sending data to the client
-        
-        payloadBytesWritten := int(payloadLen - payloadBytesToWrite)
-
-        copy(b[ptr:], payload[payloadBytesWritten:payloadBytesWritten + int(totalPayloadBytesThisFrame)])
-
-        n, err := w.Write(b[:headerLen + int(totalPayloadBytesThisFrame)])
+        n, err := w.Write(b[payloadByteOffset:payloadByteOffset + int(totalPayloadBytesThisFrame)])
         if err != nil {
             return err
         }
 
-        payloadBytesToWrite -= uint64(n - headerLen)
+        payloadBytesToWrite -= uint64(n)
+        payloadByteOffset += n
 
-        log.Printf("sending frame #%d of %d byte(s), isFin=%t, finRsvOp=%08b\n", frame + 1, n, isFin, b[0])
+        log.Printf("sending frame #%d of %d byte(s), header.length=%d, isFin=%t, finRsvOp=%08b\n", frame + 1, n, h.length, h.isFin, h.op)
+
+        if err := w.Flush(); err != nil {
+            return err
+        }
 
         frame++
     }
@@ -140,107 +100,31 @@ func send(w net.Conn, t frameType, b []byte, payload []byte, payloadLen uint64) 
 func handle(c net.Conn) {
 	defer c.Close()
 
-    var wBuffer []byte = make([]byte, 1024)
-	var payload []byte = make([]byte, 1024*1024*2)
-	var maskingKey []byte = make([]byte, 4)
+    var h *header = &header{}
+
+	var buffer []byte = make([]byte, 1024*1024*2)
 
 	r := bufio.NewReader(c)
+	w := bufio.NewWriter(c)
 
 	for {
-		finRsvOp, err := r.ReadByte()
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			log.Printf("failed to read flags: %v\n", err)
-			continue
-		}
+        if err := h.read(r); err != nil {
+            if err == io.EOF {
+                log.Printf("failed to read header, client disconnected\n")
+                break
+            }
+            log.Printf("failed to read header: %v\n", err)
+            break
+        }
 
-		isFin := false
-		if (finRsvOp & mFin) == mFin {
-			isFin = true
-		}
+        // TOOD: Send actual close when this happens
+        if h.length > uint64(cap(buffer)) {
+            panic(fmt.Sprintf("payload too big for curent buffer capacity, length=%d, capacity=%s\n", h.length, cap(buffer)))
+        }
 
-		fType := frameType(finRsvOp & mOp)
+		log.Printf("client frame isFin=%t, fType=%08b (%s), isMasked=%t, payloadLen=%d\n", h.isFin, h.op, h.op, h.isMasked, h.length)
 
-		if fType.String() == "unknown" {
-			log.Printf("received unsupported frame type '%08b', ignoring frame\n", fType)
-			continue
-		}
-
-		maskPayloadLen, err := r.ReadByte()
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			log.Printf("failed to read mask and payload length: %v\n", err)
-			continue
-		}
-
-		isMasked := false
-		if (maskPayloadLen & mMask) == mMask {
-			isMasked = true
-		}
-
-		payloadLen := uint64(maskPayloadLen & mPayloadLen)
-		if payloadLen > 125 {
-			if payloadLen == 126 {
-				b, err := r.Peek(2)
-				if err != nil {
-					if err == io.EOF {
-						break
-					}
-					log.Printf("failed to read the rest of payload length: %v\n", err)
-					continue
-				}
-				payloadLen = uint64(uint16(b[0])<<(16-8) | uint16(b[1]))
-				if _, err := r.Discard(2); err != nil {
-					if err == io.EOF {
-						break
-					}
-					log.Printf("failed to discard 2 bytes: %v\n", err)
-					continue
-				}
-			} else if payloadLen == 127 {
-				b, err := r.Peek(8)
-				if err != nil {
-					if err == io.EOF {
-						break
-					}
-					log.Printf("failed to read the rest of payload length: %v\n", err)
-					continue
-				}
-				payloadLen = (uint64(b[0])<<(64-8) |
-					uint64(b[1])<<(64-16) |
-					uint64(b[2])<<(64-24) |
-					uint64(b[3])<<(64-32) |
-					uint64(b[4])<<(64-40) |
-					uint64(b[5])<<(64-48) |
-					uint64(b[6])<<(64-56) |
-					uint64(b[7]))
-				if _, err := r.Discard(8); err != nil {
-					if err == io.EOF {
-						break
-					}
-					log.Printf("failed to discard 8 bytes: %v\n", err)
-					continue
-				}
-			}
-		}
-
-		if isMasked {
-			if _, err = r.Read(maskingKey); err != nil {
-				if err == io.EOF {
-					break
-				}
-				log.Printf("failed to read masking key: %v\n", err)
-				continue
-			}
-		}
-
-		log.Printf("client frame isFin=%t (%08b), fType=%08b (%s), isMasked=%t, payloadLen=%d\n", isFin, (finRsvOp & mFin), fType, fType, isMasked, payloadLen)
-
-        n, err := io.ReadFull(r, payload[0:payloadLen])
+        n, err := io.ReadFull(r, buffer[0:h.length])
         if err != nil {
             if err == io.EOF {
                 break
@@ -249,16 +133,17 @@ func handle(c net.Conn) {
             continue
         }
 
-        if n != int(payloadLen) {
-            panic(fmt.Sprintf("have payload length of %d but only could only read %d byte(s)\n", payloadLen, n))
+        if n != int(h.length) {
+            panic(fmt.Sprintf("have payload length of %d but only could only read %d byte(s)\n", h.length, n))
         }
 
-        switch fType {
+        switch h.op {
         case ping:
-            if err := send(c, pong, wBuffer, payload, payloadLen); err != nil {
-                log.Printf("failed to send pong: %v\n", err)
-                continue
-            }
+            //h.op = pong
+            //if err := send(w, h, buffer); err != nil {
+            //    log.Printf("failed to send pong: %v\n", err)
+            //    continue
+            //}
         case connclose:
             // TODO: Clean this up, we handle a close here differently to how 
             // we handle close for any other case.
@@ -269,14 +154,12 @@ func handle(c net.Conn) {
             }
             return
         case text, binary:
-            if isMasked {
-                for i := 0; i < int(payloadLen); i++ {
-                    payload[i] ^= maskingKey[i%4]
+            if h.isMasked {
+                for i := 0; i < int(h.length); i++ {
+                    buffer[i] ^= h.mask[i%4]
                 }
             }
-
-            // NOTE: For now, we just echo back the data
-            if err := send(c, fType, wBuffer, payload, payloadLen); err != nil {
+            if err := send(w, h, buffer); err != nil {
                 log.Printf("failed to send echo: %v\n", err)
                 continue
             }

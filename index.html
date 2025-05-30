@@ -32,7 +32,7 @@
                 const socket = new WebSocket("ws://localhost:3000");
                 socket.addEventListener("open", (e) => {
                     //send(socket, "If you can see this, it works!")
-                    send(socket, "ab".repeat(1_000))
+                    send(socket, "ab".repeat(10_000))
 
                     const doMany = (time, f) => {
                         f(time)
