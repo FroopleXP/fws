@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+    "bytes"
 	"log"
 	"math"
 	"net"
@@ -58,6 +59,20 @@ func send(w *bufio.Writer, h *header, b []byte) error {
 	h.isFin = false
 	h.isMasked = false
 
+    // If there's no payload, we still need to repsond with empty
+    if h.length == 0 {
+        h.isFin = true
+        if err := h.write(w); err != nil {
+            return err
+        }
+
+        if err := w.Flush(); err != nil {
+            return err
+        }
+
+        return nil
+    }
+
 	frame := 0
 	payloadBytesToWrite := h.length
 	maxPayloadBytesPerFrame := uint64(w.Size()) - h.size()
@@ -95,6 +110,66 @@ func send(w *bufio.Writer, h *header, b []byte) error {
 	}
 
 	return nil
+}
+
+type status uint16
+
+const (
+    statusNormal = status(iota + 1000)
+    statusGoingAway
+    statusProtoErr
+    statusUnacceptable
+    _
+    _
+    _
+    statusViolation
+    statusTooBig
+    _
+    statusUnexpected
+)
+
+func (s status) String() string {
+    switch s {
+    case statusNormal:
+        return "normal"
+    case statusGoingAway:
+        return "going away"
+    case statusProtoErr:
+        return "protocol error"
+    case statusUnacceptable:
+        return "unacceptable data"
+    case statusViolation:
+        return "violation"
+    case statusTooBig:
+        return "message too big to process"
+    case statusUnexpected:
+        return "unexpected error during processing"
+    }
+    return "unknown"
+}
+
+func sendClose(w *bufio.Writer, h *header, buffer []byte, status status, text bool) error {
+    h.op = connclose 
+    h.isMasked = false
+
+    b := bytes.NewBuffer(buffer)
+    b.Reset()
+    
+    for i := 16 - 8; i >= 0; i -= 8 {
+        if err := b.WriteByte(byte(status >> i)); err != nil {
+            return err
+        }
+    }
+
+    if text {
+        if _, err := b.WriteString(status.String()); err != nil {
+            return err
+        }
+    }
+
+    h.length = uint64(b.Len())
+
+    return send(w, h, buffer)
 }
 
 func handle(c net.Conn) {
@@ -137,6 +212,12 @@ func handle(c net.Conn) {
 			panic(fmt.Sprintf("have payload length of %d but only could only read %d byte(s)\n", h.length, n))
 		}
 
+        if h.isMasked {
+            for i := 0; i < int(h.length); i++ {
+                buffer[i] ^= h.mask[i%4]
+            }
+        }
+
 		switch h.op {
 		case ping:
 			//h.op = pong
@@ -149,16 +230,14 @@ func handle(c net.Conn) {
 			// we handle close for any other case.
 			// TODO: Closing here, in this way, actually triggers 2 closes
 			// the one here, and the one from the 'defer'.
+            if err := sendClose(w, h, buffer, statusNormal, false); err != nil {
+                log.Printf("failed to send close frame: %v\n", err)
+            }
 			if err := c.Close(); err != nil {
 				log.Printf("failed to close connection to client\n", err)
 			}
 			return
 		case text, binary:
-			if h.isMasked {
-				for i := 0; i < int(h.length); i++ {
-					buffer[i] ^= h.mask[i%4]
-				}
-			}
 			if err := send(w, h, buffer); err != nil {
 				log.Printf("failed to send echo: %v\n", err)
 				continue
