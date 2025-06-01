@@ -5,9 +5,16 @@ import (
 	"math"
 )
 
+// Consts prefixed with 'm' declare a mask
+const (
+	mFin, mMask uint8 = 0x80, 0x80
+	mOp         uint8 = 0x0f
+	mPayloadLen uint8 = 0x7f
+)
+
 type header struct {
 	isFin    bool
-	op       frameType
+	op       opCode
 	length   uint64
 	isMasked bool
 	mask     []byte
@@ -97,7 +104,7 @@ func (h *header) read(r *bufio.Reader) error {
 		h.isFin = true
 	}
 
-	h.op = frameType(finRsvOp & mOp)
+	h.op = opCode(finRsvOp & mOp)
 
 	maskPayloadLen, err := r.ReadByte()
 	if err != nil {
