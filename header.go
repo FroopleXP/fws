@@ -8,12 +8,14 @@ import (
 // Consts prefixed with 'm' declare a mask
 const (
 	mFin, mMask uint8 = 0x80, 0x80
+	mRsv        uint8 = 0x70
 	mOp         uint8 = 0x0f
 	mPayloadLen uint8 = 0x7f
 )
 
 type header struct {
 	isFin    bool
+	rsv      byte
 	op       opCode
 	length   uint64
 	isMasked bool
@@ -24,13 +26,15 @@ type header struct {
 func (h *header) size() uint64 {
 	var size uint64 = 2
 
-	if h.length > 125 && h.length <= math.MaxUint16 {
-		size += 2
-	} else {
-		size += 8
+	if h.length > 125 {
+		if h.length <= math.MaxUint16 {
+			size += 2
+		} else if h.length > math.MaxUint16 && h.length <= math.MaxUint64 {
+			size += 8
+		}
 	}
 
-	if h.isMasked && h.mask != nil {
+	if h.isMasked {
 		size += 4
 	}
 
@@ -94,7 +98,12 @@ func (h *header) write(w *bufio.Writer) error {
 }
 
 func (h *header) read(r *bufio.Reader) error {
-	finRsvOp, err := r.ReadByte()
+	b, err := r.Peek(2)
+	if err != nil {
+		return err
+	}
+
+	finRsvOp := b[0]
 	if err != nil {
 		return err
 	}
@@ -104,10 +113,16 @@ func (h *header) read(r *bufio.Reader) error {
 		h.isFin = true
 	}
 
+	h.rsv = (finRsvOp & mRsv) >> 4
+
 	h.op = opCode(finRsvOp & mOp)
 
-	maskPayloadLen, err := r.ReadByte()
+	maskPayloadLen := b[1]
 	if err != nil {
+		return err
+	}
+
+	if _, err := r.Discard(2); err != nil {
 		return err
 	}
 
@@ -119,7 +134,7 @@ func (h *header) read(r *bufio.Reader) error {
 	h.length = uint64(maskPayloadLen & mPayloadLen)
 	if h.length > 125 {
 		if h.length == 126 {
-			b, err := r.Peek(2)
+			b, err = r.Peek(2)
 			if err != nil {
 				return err
 			}
@@ -128,7 +143,7 @@ func (h *header) read(r *bufio.Reader) error {
 				return err
 			}
 		} else if h.length == 127 {
-			b, err := r.Peek(8)
+			b, err = r.Peek(8)
 			if err != nil {
 				return err
 			}
@@ -150,7 +165,15 @@ func (h *header) read(r *bufio.Reader) error {
 		if h.mask == nil {
 			h.mask = make([]byte, 4)
 		}
-		if _, err = r.Read(h.mask); err != nil {
+
+		b, err = r.Peek(4)
+		if err != nil {
+			return err
+		}
+
+		copy(h.mask, b[:])
+
+		if _, err := r.Discard(4); err != nil {
 			return err
 		}
 	}

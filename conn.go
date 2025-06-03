@@ -1,55 +1,56 @@
 package main
 
 import (
-    "bufio"
-    "net"
-    "io"
-    "math"
-    "bytes"
-    "fmt"
-    "log"
+	"bufio"
+	"bytes"
+	"fmt"
+	"io"
+	"log"
+	"math"
+	"net"
 )
 
 type state uint8
 
 const (
-    open = state(iota)
-    closed
-    closing
+	open = state(iota)
+	closed
+	closing
+	peerClosing
 )
 
 type conn struct {
-    socket   net.Conn
-    buffer   []byte
-    h        *header
-    w        *bufio.Writer
-    r        *bufio.Reader
-    
-    state    state
+	socket net.Conn
+	buffer []byte
+	h      *header
+	w      *bufio.Writer
+	r      *bufio.Reader
+
+	state state
 }
 
 func (c *conn) handle() error {
-    if c.socket == nil {
-        return fmt.Errorf("socket is not defined")
-    }
+	if c.socket == nil {
+		return fmt.Errorf("socket is not defined")
+	}
 
-    if c.buffer == nil {
-        c.buffer = make([]byte, 1024 * 1024 * 2)
-    }
+	if c.buffer == nil {
+		c.buffer = make([]byte, 1024*1024*2)
+	}
 
-    if c.h == nil {
-        c.h = &header{}
-    }
+	if c.h == nil {
+		c.h = &header{}
+	}
 
-    if c.w == nil {
-        c.w = bufio.NewWriter(c.socket)
-    }
+	if c.w == nil {
+		c.w = bufio.NewWriter(c.socket)
+	}
 
-    if c.r == nil {
-        c.r = bufio.NewReader(c.socket)
-    }
+	if c.r == nil {
+		c.r = bufio.NewReader(c.socket)
+	}
 
-    c.state = open
+	c.state = open
 
 	for c.state != closed {
 		if err := c.h.read(c.r); err != nil {
@@ -61,41 +62,51 @@ func (c *conn) handle() error {
 			break
 		}
 
-		// TOOD: Send actual close when this happens
-		if c.h.length > uint64(cap(c.buffer)) {
-			panic(fmt.Sprintf("payload too big for curent buffer capacity, length=%d, capacity=%s\n", c.h.length, cap(c.buffer)))
+		// Can't be having those reserve bits set or use a reserved non-control op-code, who the fuck do you think you are?
+		if c.h.rsv != 0x00 || c.h.op.isReserved() {
+			if err := c.sendClose(statusProtoErr, false); err != nil {
+				return err
+			}
+			return nil
 		}
 
-		log.Printf("client frame isFin=%t, fType=%08b (%s), isMasked=%t, payloadLen=%d\n", c.h.isFin, c.h.op, c.h.op, c.h.isMasked, c.h.length)
+		if c.h.length > uint64(cap(c.buffer)) {
+			if err := c.sendClose(statusTooBig, false); err != nil {
+				return err
+			}
+			return nil
+		}
 
-		n, err := io.ReadFull(c.r, c.buffer[0:c.h.length])
+		log.Printf("client frame isFin=%t, rsv=%08b fType=%08b (%s), isMasked=%t, payloadLen=%d, header.size()=%d\n", c.h.isFin, c.h.rsv, c.h.op, c.h.op, c.h.isMasked, c.h.length, c.h.size())
+
+		n, err := io.ReadFull(c.r, c.buffer[:c.h.length])
 		if err != nil {
 			if err == io.EOF {
-				break
+				return nil
 			}
-			log.Printf("failed to read payload: %v\n", err)
-			continue
+			return err
 		}
 
 		if n != int(c.h.length) {
 			panic(fmt.Sprintf("have payload length of %d but only could only read %d byte(s)\n", c.h.length, n))
 		}
 
-        if c.h.isMasked {
-            for i := 0; i < int(c.h.length); i++ {
-                c.buffer[i] ^= c.h.mask[i%4]
-            }
-        }
+		if c.h.isMasked {
+			for i := 0; i < int(c.h.length); i++ {
+				c.buffer[i] ^= c.h.mask[i%4]
+			}
+		}
 
-        if c.h.op.isControl() {
-            if err := c.handleControlFrame(); err != nil {
-                // TODO: Work out if we need to close here!
-                log.Printf("failed to handle control frame: %v\n", err)
-                // TODO: Returning here will close the connection uncleanly
-                break
-            }
-            continue
-        }
+		if c.h.op.isControl() {
+			if err := c.handleControlFrame(); err != nil {
+				log.Printf("failed to handle control frame: %v\n", err)
+				if err := c.sendClose(statusProtoErr, true); err != nil {
+					return err
+				}
+				return nil
+			}
+			continue
+		}
 
 		switch c.h.op {
 		case text, binary:
@@ -105,52 +116,66 @@ func (c *conn) handle() error {
 			}
 		}
 	}
-    return nil
+
+	return nil
 }
 
 func (c *conn) handleControlFrame() error {
-    switch c.h.op {
-    case ping:
-        c.h.op = pong
-    case pong:
-        c.h.op = ping
-    case connclose:
-        // If we're closing, it means that this most recent close frame is in response
-        // to a close frame we already sent which in turn completes the closing handshake.
-        if c.state == closing {
-            c.state = closed
-            return nil
-        }
+	switch c.h.op {
+	case ping:
+		c.h.op = pong
+	case pong:
+		c.h.op = ping
+	case connclose:
+		// If we're 'closing' and we've recevied a close frame, we know it's from the peer,
+		// responding to our initiated close handshake.
+		if c.state == closing {
+			c.state = closed
+			return nil
+		}
 
-        return c.sendClose(statusNormal, false);
-    }
+		// If we're 'open' and we've recevied a close frame, it means the peer has initiated
+		// the close handshake.
+		if c.state == open {
+			c.state = peerClosing
+		}
 
-    return c.send()
+		return c.sendClose(statusNormal, false)
+	}
+
+	return c.send()
 }
 
 func (c *conn) sendClose(status status, text bool) error {
-    c.h.op = connclose 
-    c.h.isMasked = false
-    c.state = closing
+	c.h.op = connclose
 
-    b := bytes.NewBuffer(c.buffer)
-    b.Reset()
-    
-    for i := 16 - 8; i >= 0; i -= 8 {
-        if err := b.WriteByte(byte(status >> i)); err != nil {
-            return err
-        }
-    }
+	// If the connection was open and we're now sending a close it means
+	// we've started the close handshake, else the peer has started the close
+	// handshake so this is the last frame we're sending.
+	if c.state == open {
+		c.state = closing
+	} else if c.state == peerClosing {
+		c.state = closed
+	}
 
-    if text {
-        if _, err := b.WriteString(status.String()); err != nil {
-            return err
-        }
-    }
+	b := bytes.NewBuffer(c.buffer)
+	b.Reset()
 
-    c.h.length = uint64(b.Len())
+	for i := 16 - 8; i >= 0; i -= 8 {
+		if err := b.WriteByte(byte(status >> i)); err != nil {
+			return err
+		}
+	}
 
-    return c.send()
+	if text {
+		if _, err := b.WriteString(status.String()); err != nil {
+			return err
+		}
+	}
+
+	c.h.length = uint64(b.Len())
+
+	return c.send()
 }
 
 // send whatever the current contents of 'buffer' is, fragmenting the data when necessary
@@ -159,24 +184,29 @@ func (c *conn) send() error {
 	c.h.isFin = false
 	c.h.isMasked = false
 
-    // A control frame's payload may not exceed 125 bytes
-    if c.h.op.isControl() && c.h.length > 125 {
-        return c.sendClose(statusProtoErr, true)
-    }
+	// A control frame's payload may not exceed 125 bytes
+	if c.h.op.isControl() && c.h.length > 125 {
+		return c.sendClose(statusProtoErr, true)
+	}
 
-    // If there's no payload, we still need to repsond with empty
-    if c.h.length == 0 {
-        c.h.isFin = true
-        if err := c.h.write(c.w); err != nil {
-            return err
-        }
+	// Control frames must always be sent in 1 frame
+	if c.h.op.isControl() {
+		c.h.isFin = true
+	}
 
-        if err := c.w.Flush(); err != nil {
-            return err
-        }
+	// If there's no payload, we still need to repsond with empty
+	if c.h.length == 0 {
+		c.h.isFin = true
+		if err := c.h.write(c.w); err != nil {
+			return err
+		}
 
-        return nil
-    }
+		if err := c.w.Flush(); err != nil {
+			return err
+		}
+
+		return nil
+	}
 
 	frame := 0
 	payloadBytesToWrite := c.h.length
@@ -189,12 +219,12 @@ func (c *conn) send() error {
 		totalPayloadBytesThisFrame := uint64(math.Min(float64(payloadBytesToWrite), float64(maxPayloadBytesPerFrame)))
 		c.h.length = totalPayloadBytesThisFrame
 
-        // If we're not on the first frame, we must set the 'continuation' op code
-        if payloadByteOffset > 0 {
-            c.h.op = continuation
-        }
+		// If we're not on the first frame, we must set the 'continuation' op code
+		if payloadByteOffset > 0 {
+			c.h.op = continuation
+		}
 
-        // If we're on the last frame, set 'fin'
+		// If we're on the last frame, set 'fin'
 		if payloadBytesToWrite < maxPayloadBytesPerFrame {
 			c.h.isFin = true
 		}

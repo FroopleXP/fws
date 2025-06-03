@@ -36,10 +36,16 @@ func (o opCode) String() string {
 }
 
 func (o opCode) isControl() bool {
-    switch o {
-    case ping, pong, connclose:
-        return true
-    }
-    return false
+	switch o {
+	case ping, pong, connclose:
+		return true
+	}
+	return false
 }
 
+func (o opCode) isReserved() bool {
+	if (o > 2 && o < 8) || o > 10 {
+		return true
+	}
+	return false
+}
