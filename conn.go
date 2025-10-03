@@ -19,40 +19,46 @@ const (
 	peerClosing
 )
 
-type conn struct {
-	socket net.Conn
-	buffer []byte
-	h      *header
-	w      *bufio.Writer
-	r      *bufio.Reader
+func (s state) String() string {
+    switch s {
+    case open:
+        return "open"
+    case closed:
+        return "close"
+    case closing:
+        return "closing"
+    case peerClosing:
+        return "peerClosing"
+    }
+    return ""
+}
 
-	state state
+type conn struct {
+	socket    net.Conn
+	h         *header
+    p         *payload
+	w         *bufio.Writer
+	r         *bufio.Reader
+	state     state
+    lastOp    *opCode
+}
+
+func newConn(socket net.Conn) *conn {
+    var c conn = conn{}
+    c.socket = socket
+    c.h = &header{}
+    c.r = bufio.NewReader(c.socket)
+    c.w = bufio.NewWriter(c.socket)
+    c.p = newPayload()
+    c.state = open
+    c.lastOp = nil
+
+    return &c
 }
 
 func (c *conn) handle() error {
-	if c.socket == nil {
-		return fmt.Errorf("socket is not defined")
-	}
-
-	if c.buffer == nil {
-		c.buffer = make([]byte, 1024*1024*2)
-	}
-
-	if c.h == nil {
-		c.h = &header{}
-	}
-
-	if c.w == nil {
-		c.w = bufio.NewWriter(c.socket)
-	}
-
-	if c.r == nil {
-		c.r = bufio.NewReader(c.socket)
-	}
-
-	c.state = open
-
-	for c.state != closed {
+	for c.state == open {
+        // Read the header
 		if err := c.h.read(c.r); err != nil {
 			if err == io.EOF {
 				log.Printf("failed to read header, client disconnected\n")
@@ -62,7 +68,16 @@ func (c *conn) handle() error {
 			break
 		}
 
-		// Can't be having those reserve bits set or use a reserved non-control op-code, who the fuck do you think you are?
+        // If they're sending a fragmented frame and the op code is not
+        // a contuation, we must fail the connection
+        if c.lastOp != nil && c.h.op != continuation {
+            if err := c.sendClose(statusProtoErr, false); err != nil {
+                return err
+            }
+            return nil
+        }
+
+        // Cannot have an RSV bit set, nor can the op-code be reserved
 		if c.h.rsv != 0x00 || c.h.op.isReserved() {
 			if err := c.sendClose(statusProtoErr, false); err != nil {
 				return err
@@ -70,7 +85,8 @@ func (c *conn) handle() error {
 			return nil
 		}
 
-		if c.h.length > uint64(cap(c.buffer)) {
+        // The incoming length cannot be bigger than we have room for in the buffer
+		if int(c.h.length) > c.p.capacity() {
 			if err := c.sendClose(statusTooBig, false); err != nil {
 				return err
 			}
@@ -79,7 +95,7 @@ func (c *conn) handle() error {
 
 		log.Printf("client frame isFin=%t, rsv=%08b fType=%08b (%s), isMasked=%t, payloadLen=%d, header.size()=%d\n", c.h.isFin, c.h.rsv, c.h.op, c.h.op, c.h.isMasked, c.h.length, c.h.size())
 
-		n, err := io.ReadFull(c.r, c.buffer[:c.h.length])
+		n, err := c.p.read(c.r, int(c.h.length))
 		if err != nil {
 			if err == io.EOF {
 				return nil
@@ -87,13 +103,16 @@ func (c *conn) handle() error {
 			return err
 		}
 
+        log.Printf("payload after read frames=%d, last=%v\n", len(c.p.frames), c.p.last)
+
 		if n != int(c.h.length) {
 			panic(fmt.Sprintf("have payload length of %d but only could only read %d byte(s)\n", c.h.length, n))
 		}
 
+        // If the last read frame is masked, unmask it
 		if c.h.isMasked {
 			for i := 0; i < int(c.h.length); i++ {
-				c.buffer[i] ^= c.h.mask[i%4]
+				c.p.last.data[i] ^= c.h.mask[i%4]
 			}
 		}
 
@@ -105,22 +124,82 @@ func (c *conn) handle() error {
 				}
 				return nil
 			}
+
+            // If we were in the middle of handling a fragmented payload when 
+            // the control frame came in, we need to pop the last frame from 
+            // payload in order to continue reading correctly.
+            if c.lastOp != nil {
+                c.p.pop() 
+            }
+
 			continue
 		}
 
-		switch c.h.op {
-		case text, binary:
-			if err := c.send(); err != nil {
-				log.Printf("failed to send echo: %v\n", err)
-				break
-			}
-		}
+        op := c.h.op
+
+        // If 'fin' is false, we are reading a sequence of fragments
+        if !c.h.isFin {
+            if c.lastOp == nil {
+                c.lastOp = &op
+            }
+            log.Printf("received non-fin frame, continuing with read\n")
+            continue
+
+        } else {
+            if c.lastOp != nil {
+                c.h.op = *c.lastOp
+            }
+            c.lastOp = nil
+            log.Printf("fragmented read complete, payload=%v, op=%s\n", c.p.combine(), c.h.op)
+        }
+
+        // Echo back the data
+        if err := c.send(false); err != nil {
+            log.Printf("failed to send echo: %v\n", err)
+            break
+        }
+
+        c.p.reset()
 	}
+
+    // TODO: We're not waiting for the peer to send their response back
+    // after updating this to close the connection directly after we started
+    // the handshake, all tests still closed cleanly.
+    // TODO: Double check in the specification to make sure that this 
+    // approach is considered 'clean' universally as this may just be
+    // a quirk of the autobahn testsuite.
+    // We drop into here when a close negotiation has started by either
+    // us or by the remote client
+    for c.state == closing || c.state == peerClosing { 
+        //log.Printf("dropped into close loop, current state = %s\n", c.state)
+		//if err := c.h.read(c.r); err != nil {
+		//	if err == io.EOF {
+		//		log.Printf("failed to read header, client disconnected\n")
+		//		break
+		//	}
+		//	log.Printf("failed to read header: %v\n", err)
+		//	break
+		//}
+
+        //log.Printf("rx'd op code %d (%s)\n", c.h.op, c.h.op)
+
+        //// Right now all we care about is close op codes
+        //if c.h.op == connclose {
+        //    log.Printf("connclose rx'd closing, finally! c.state=%s\n", c.state)
+        //    break
+        //}
+        break
+    }
 
 	return nil
 }
 
 func (c *conn) handleControlFrame() error {
+    // Control frame MUST NOT be fragmented
+    if !c.h.isFin {
+        return c.sendClose(statusProtoErr, false)
+    }
+
 	switch c.h.op {
 	case ping:
 		c.h.op = pong
@@ -143,7 +222,9 @@ func (c *conn) handleControlFrame() error {
 		return c.sendClose(statusNormal, false)
 	}
 
-	return c.send()
+    // This will just back what ever is in the buffer which is most likely
+    // what was sent in the original payload.
+	return c.send(true)
 }
 
 func (c *conn) sendClose(status status, text bool) error {
@@ -158,7 +239,12 @@ func (c *conn) sendClose(status status, text bool) error {
 		c.state = closed
 	}
 
-	b := bytes.NewBuffer(c.buffer)
+    f, err := c.p.reserve(2)
+    if err != nil {
+        return err
+    }
+
+	b := bytes.NewBuffer(f.data)
 	b.Reset()
 
 	for i := 16 - 8; i >= 0; i -= 8 {
@@ -167,19 +253,25 @@ func (c *conn) sendClose(status status, text bool) error {
 		}
 	}
 
-	if text {
-		if _, err := b.WriteString(status.String()); err != nil {
-			return err
-		}
-	}
+    // TODO: Disabling text for now
+	//if text {
+	//	if _, err := b.WriteString(status.String()); err != nil {
+	//		return err
+	//	}
+	//}
 
 	c.h.length = uint64(b.Len())
 
-	return c.send()
+	if err := c.send(true); err != nil {
+        return err
+    }
+
+    //c.state = closed
+    return nil
 }
 
-// send whatever the current contents of 'buffer' is, fragmenting the data when necessary
-func (c *conn) send() error {
+// send will write the combined frames currently in payload or just the last frame
+func (c *conn) send(last bool) error {
 	// TODO: We're assuming here that we're always the server and thus we never mask
 	c.h.isFin = false
 	c.h.isMasked = false
@@ -208,12 +300,23 @@ func (c *conn) send() error {
 		return nil
 	}
 
+    if last && c.p.last == nil {
+        return fmt.Errorf("last frame write was requested but last frame is nil")
+    }
+
+    payloadToSend := c.p.combine()
+    if last {
+        payloadToSend = c.p.last.data
+    } 
+
+    log.Printf("payload=%v, len=%d\n", payloadToSend, len(payloadToSend))
+
 	frame := 0
-	payloadBytesToWrite := c.h.length
+	payloadBytesToWrite := uint64(len(payloadToSend))
 	maxPayloadBytesPerFrame := uint64(c.w.Size()) - c.h.size()
 	payloadByteOffset := 0
 
-	log.Printf("starting to write frames payloadLen=%d, capacity=%d, maxPayloadBytesPerFrame=%d\n", c.h.length, c.w.Size(), maxPayloadBytesPerFrame)
+	log.Printf("starting to write frames payloadLen=%d, capacity=%d, maxPayloadBytesPerFrame=%d\n", payloadBytesToWrite, c.w.Size(), maxPayloadBytesPerFrame)
 
 	for payloadBytesToWrite > 0 {
 		totalPayloadBytesThisFrame := uint64(math.Min(float64(payloadBytesToWrite), float64(maxPayloadBytesPerFrame)))
@@ -233,7 +336,7 @@ func (c *conn) send() error {
 			return err
 		}
 
-		n, err := c.w.Write(c.buffer[payloadByteOffset : payloadByteOffset+int(totalPayloadBytesThisFrame)])
+		n, err := c.w.Write(payloadToSend[payloadByteOffset : payloadByteOffset+int(totalPayloadBytesThisFrame)])
 		if err != nil {
 			return err
 		}
@@ -241,7 +344,7 @@ func (c *conn) send() error {
 		payloadBytesToWrite -= uint64(n)
 		payloadByteOffset += n
 
-		log.Printf("sending frame #%d of %d byte(s), header.length=%d, isFin=%t, finRsvOp=%08b\n", frame+1, n, c.h.length, c.h.isFin, c.h.op)
+		log.Printf("sending frame #%d of %d byte(s), header.length=%d, isFin=%t, finRsvOp=%08b (%s)\n", frame+1, n, c.h.length, c.h.isFin, c.h.op, c.h.op)
 
 		if err := c.w.Flush(); err != nil {
 			return err

@@ -49,8 +49,7 @@ func handle(c net.Conn) {
 		c.Close()
 	}(c)
 
-	var conn *conn = &conn{}
-	conn.socket = c
+	var conn *conn = newConn(c)
 
 	// When 'handle' is done, so is the client so we can close the connection
 	if err := conn.handle(); err != nil {
